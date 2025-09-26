@@ -5,6 +5,7 @@ Multi-DEX funding-fee arbitrage framework with a FastAPI control plane, modular 
 ---
 
 ## 1. Overview
+
 - **Language / Runtime**: Python 3.11 (managed with [uv](https://docs.astral.sh/uv/)).
 - **Core entrypoint**: `app/server.py` (FastAPI application exposing REST endpoints to run/monitor bots).
 - **Current DEX support**: AsterDex (spot + futures). Architecture prepared for additional integrations.
@@ -14,13 +15,13 @@ Multi-DEX funding-fee arbitrage framework with a FastAPI control plane, modular 
 
 ```mermaid
 graph TD
-    A[Scripts/start_server.sh] -->|launch| B(FastAPI Server<br/>app/server.py)
-    B -->|creates| C[DexFactory<br/>dexes/factory.py]
-    C -->|instantiates| D[AsterDex Adapter<br/>dexes/asterdex/*]
+    A[Scripts/start_server.sh] -->|launch| B[FastAPI Server (app/server.py)]
+    B -->|creates| C[DexFactory (dexes/factory.py)]
+    C -->|instantiates| D[AsterDex Adapter (dexes/asterdex/*)]
     D -->|calls REST APIs| E[(AsterDex Spot & Futures)]
     B -->|writes snapshots| F[(monitor_data cache)]
     F -->|served via| G[/REST endpoints/]
-    subgraph Legacy (optional)
+    subgraph "Legacy (optional)"
         L[legacy/* scripts] -->|standalone CLI| D
     end
 ```
@@ -28,6 +29,7 @@ graph TD
 ---
 
 ## 2. Repository Layout
+
 ```
 funding-rate-arb/
 ├── app/                 # FastAPI application (server + config facade)
@@ -49,6 +51,7 @@ funding-rate-arb/
 ---
 
 ## 3. Quick Start
+
 1. **Clone the repo & enter the directory**
    ```bash
    git clone https://github.com/xxkhanxx77/funding-rate-arb.git
@@ -72,6 +75,7 @@ funding-rate-arb/
 5. **Visit the API docs** – http://0.0.0.0:8000/docs
 
 Server logs emit a snapshot summary every `FUNDING_MONITOR_INTERVAL` seconds (default 60):
+
 ```
 INFO:app.server:Snapshot ASTERDEX | Value $104.91 | PnL $-4.76 | Funding30d $0.37 |
                  APY 23.54% | LastRate 0.0215% | Next 2025-09-27T07:00:00
@@ -80,19 +84,23 @@ INFO:app.server:Snapshot ASTERDEX | Value $104.91 | PnL $-4.76 | Funding30d $0.3
 ---
 
 ## 4. Configuration
+
 ### `.env` variables
-| Variable | Description |
-|----------|-------------|
-| `ASTERDEX_API_KEY` / `ASTERDEX_API_SECRET` | API key/secret for AsterDex spot & futures trading. |
-| `FUNDING_DEX` | DEX identifier to use (`asterdex`). |
-| `FUNDING_CAPITAL` | Total quote capital (USDT) per bot run. |
-| `FUNDING_BATCH_QUOTE` | Quote size per batch order. |
-| `FUNDING_MODE` | Strategy direction (`buy_spot_short_futures` or `sell_spot_long_futures`). |
-| `FUNDING_MONITOR_INTERVAL` | Seconds between background monitor refreshes (default 60). |
-| `FUNDING_LOG_LEVEL` | Logging verbosity (`INFO`, `DEBUG`, ...). |
+
+| Variable                                   | Description                                                                |
+| ------------------------------------------ | -------------------------------------------------------------------------- |
+| `ASTERDEX_API_KEY` / `ASTERDEX_API_SECRET` | API key/secret for AsterDex spot & futures trading.                        |
+| `FUNDING_DEX`                              | DEX identifier to use (`asterdex`).                                        |
+| `FUNDING_CAPITAL`                          | Total quote capital (USDT) per bot run.                                    |
+| `FUNDING_BATCH_QUOTE`                      | Quote size per batch order.                                                |
+| `FUNDING_MODE`                             | Strategy direction (`buy_spot_short_futures` or `sell_spot_long_futures`). |
+| `FUNDING_MONITOR_INTERVAL`                 | Seconds between background monitor refreshes (default 60).                 |
+| `FUNDING_LOG_LEVEL`                        | Logging verbosity (`INFO`, `DEBUG`, ...).                                  |
 
 ### JSON configuration (optional legacy workflow)
+
 `samples/bot_config.json` mirrors the same fields. The CLI helper `scripts/manage_config.py` can show/update these values:
+
 ```bash
 uv run python scripts/manage_config.py show
 uv run python scripts/manage_config.py update '{"capital": "200", "batch_quote": "20"}'
@@ -103,23 +111,25 @@ FastAPI always prioritises environment variables; JSON is preserved for compatib
 ---
 
 ## 5. Monitoring & API Endpoints
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Basic metadata & supported DEXes |
-| `/health` | GET | Heartbeat check |
-| `/dexes` | GET | List supported DEX identifiers |
-| `/monitor/{dex}` | GET | JSON snapshot (portfolio, hedging, mark price, APY) |
-| `/monitor/{dex}/simple` | GET | Human-friendly text summary |
-| `/apy/{dex}/simple` | GET | Funding APY analysis (7d/30d) |
-| `/start` | POST | Launch funding bot job (see docs for payload) |
-| `/status/{job_id}` | GET | Job status |
-| `/result/{job_id}` | GET | Execution result once completed |
+
+| Endpoint                | Method | Description                                         |
+| ----------------------- | ------ | --------------------------------------------------- |
+| `/`                     | GET    | Basic metadata & supported DEXes                    |
+| `/health`               | GET    | Heartbeat check                                     |
+| `/dexes`                | GET    | List supported DEX identifiers                      |
+| `/monitor/{dex}`        | GET    | JSON snapshot (portfolio, hedging, mark price, APY) |
+| `/monitor/{dex}/simple` | GET    | Human-friendly text summary                         |
+| `/apy/{dex}/simple`     | GET    | Funding APY analysis (7d/30d)                       |
+| `/start`                | POST   | Launch funding bot job (see docs for payload)       |
+| `/status/{job_id}`      | GET    | Job status                                          |
+| `/result/{job_id}`      | GET    | Execution result once completed                     |
 
 📈 **Funding APY calculation**: the mark-price monitor calls `/fapi/v1/premiumIndex` & `/fapi/v1/markPriceKlines`, then annualises the per-period rate as `rate * 3 (periods/day) * 365 * 100`. This matches the method described in the [AsterDex Futures API specification](https://github.com/asterdex/api-docs/blob/master/aster-finance-futures-api.md#symbol-order-book-ticker).
 
 ---
 
 ## 6. Extending to a New DEX
+
 1. Create a new folder under `dexes/` (e.g. `dexes/hyperliquid/`).
 2. Implement `client.py`, `funding_bot.py`, `monitor.py` using the abstract base interfaces in `dexes/base/dex_interface.py`.
 3. Register the new classes in `dexes/factory.py` (`SUPPORTED_DEXES`).
@@ -129,15 +139,19 @@ FastAPI always prioritises environment variables; JSON is preserved for compatib
 ---
 
 ## 7. Legacy Scripts (Optional)
+
 The original single-DEX CLIs live in `legacy/`. They do not affect the running API. Run them manually via module paths if needed:
+
 ```bash
 uv run python -m legacy.small_capital_strategy --dry-run --capital 200 --batch-size 20
 ```
+
 Use the new architecture for production workloads; legacy scripts remain for experimentation and reference.
 
 ---
 
 ## 8. Testing & Quality
+
 - **Unit / Smoke tests:** `uv run pytest`
 - **Type checking:** `uv run mypy .`
 - **Lint & formatting:**
@@ -151,6 +165,7 @@ The `tests/` directory currently contains smoke scripts targeting the legacy fun
 ---
 
 ## 9. Deployment & GitHub Push
+
 1. Add the remote if necessary: `git remote add origin https://github.com/xxkhanxx77/funding-rate-arb.git`
 2. Review & stage changes: `git status`, `git add ...`
 3. Commit: `git commit -m "feat: describe your change"`
@@ -161,6 +176,7 @@ The `tests/` directory currently contains smoke scripts targeting the legacy fun
 ---
 
 ## 10. Change Log / Review Notes
+
 - Introduced modular FastAPI server with DexFactory pattern.
 - Added mark-price polling to surface real-time funding APY in both logs and monitor responses.
 - Structured repository documentation (`docs/`, draw.io diagram) and clarified `.env` workflow.
@@ -169,6 +185,7 @@ The `tests/` directory currently contains smoke scripts targeting the legacy fun
 ---
 
 ## 11. References
+
 - [AsterDex Futures API specification](https://github.com/asterdex/api-docs/blob/master/aster-finance-futures-api.md#symbol-order-book-ticker)
 - [FastAPI documentation](https://fastapi.tiangolo.com/)
 - [uv package/dependency manager](https://docs.astral.sh/uv/)
