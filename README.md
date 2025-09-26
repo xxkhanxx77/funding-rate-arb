@@ -15,14 +15,15 @@ Multi-DEX funding-fee arbitrage framework with a FastAPI control plane, modular 
 
 ```mermaid
 graph TD
-    A[Scripts/start_server.sh] -->|launch| B[FastAPI Server (app/server.py)]
-    B -->|creates| C[DexFactory (dexes/factory.py)]
-    C -->|instantiates| D[AsterDex Adapter (dexes/asterdex/*)]
-    D -->|calls REST APIs| E[(AsterDex Spot & Futures)]
-    B -->|writes snapshots| F[(monitor_data cache)]
-    F -->|served via| G[/REST endpoints/]
-    subgraph "Legacy (optional)"
-        L[legacy/* scripts] -->|standalone CLI| D
+    ScriptsStart["Scripts/start_server.sh"] -->|launch| FastAPI["FastAPI Server<br/>app/server.py"]
+    FastAPI -->|creates| DexFactory["DexFactory<br/>dexes/factory.py"]
+    DexFactory -->|instantiates| Adapter["AsterDex Adapter<br/>dexes/asterdex/*"]
+    Adapter -->|calls REST APIs| AsterDex[(AsterDex Spot & Futures)]
+    FastAPI -->|writes snapshots| SnapshotCache["monitor_data cache"]
+    SnapshotCache -->|served via| RestEndpoints[/REST endpoints/]
+
+    subgraph LegacyZone["Legacy (optional)"]
+        LegacyScripts["legacy/* scripts"] -->|standalone CLI| Adapter
     end
 ```
 
