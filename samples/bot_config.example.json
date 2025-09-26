@@ -1,0 +1,14 @@
+{
+  "capital": "100",
+  "spot_symbol": "ASTERUSDT",
+  "futures_symbol": "ASTERUSDT",
+  "batch_quote": "10",
+  "batch_delay": 1.0,
+  "mode": "buy_spot_short_futures",
+  "recv_window": 5000,
+  "max_leverage": 1,
+  "stop_loss_percent": 0.0,
+  "take_profit_percent": 0.0,
+  "monitor_interval": 30,
+  "enable_notifications": false
+}

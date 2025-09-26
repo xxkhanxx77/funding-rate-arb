@@ -1,0 +1,43 @@
+<mxfile host="app.diagrams.net" modified="2025-09-27T03:30:00.000Z" agent="Codex" version="22.0.8">
+  <diagram id="architecture" name="Architecture">
+    <mxGraphModel dx="1422" dy="794" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="2" value="FastAPI Server\napp/server.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=14;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="350" y="120" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="3" value="DexFactory\n(dexes/factory.py)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=13" vertex="1" parent="1">
+          <mxGeometry x="615" y="120" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="4" value="AsterDex Adapter\nclient.py / funding_bot.py / monitor.py" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13" vertex="1" parent="1">
+          <mxGeometry x="615" y="250" width="220" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="AsterDex API\n(spot & futures)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=13" vertex="1" parent="1">
+          <mxGeometry x="900" y="260" width="150" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="Legacy Scripts\nlegacy/*" style="rounded=1;dashed=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=12" vertex="1" parent="1">
+          <mxGeometry x="120" y="260" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="7" value="Scripts & CLIs\nscripts/*" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12" vertex="1" parent="1">
+          <mxGeometry x="200" y="120" width="180" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;orthogonalLoop=1;strokeColor=#6c8ebf" edge="1" source="7" target="2" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="9" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;orthogonalLoop=1;strokeColor=#6c8ebf" edge="1" source="2" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="10" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;orthogonalLoop=1;strokeColor=#d79b00" edge="1" source="3" target="4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="11" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;orthogonalLoop=1;strokeColor=#82b366" edge="1" source="4" target="5" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="12" style="edgeStyle=orthogonalEdgeStyle;rounded=1;jettySize=auto;orthogonalLoop=1;strokeColor=#999999;dashed=1" edge="1" source="6" target="2" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
