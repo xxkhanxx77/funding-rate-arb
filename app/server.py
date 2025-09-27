@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from .config import ConfigManager
 from dexes.factory import DexFactory
@@ -114,16 +114,31 @@ monitor_thread: Optional[threading.Thread] = None
 # Pydantic models
 # -----------------------------------------------------------------------------
 class BotStartRequest(BaseModel):
-    dex: Optional[str] = Field(default=None, description="DEX identifier, e.g. 'asterdex'")
+    dex: Optional[str] = Field(default=DEFAULT_DEX, description="DEX identifier, e.g. 'asterdex'")
     capital: str = Field(default="100", description="Capital to deploy in quote currency")
-    spot_symbol: Optional[str] = Field(default=None, description="Spot trading symbol")
-    futures_symbol: Optional[str] = Field(default=None, description="Futures trading symbol")
+    spot_symbol: Optional[str] = Field(default="ASTERUSDT", description="Spot trading symbol")
+    futures_symbol: Optional[str] = Field(default="ASTERUSDT", description="Futures trading symbol")
     batch_quote: str = Field(default="10", description="Quote amount per batch")
     batch_delay: float = Field(default=1.0, description="Delay between batch executions in seconds")
     mode: str = Field(default=DEFAULT_MODE, description="Trading direction mode")
-    recv_window: Optional[int] = Field(default=None, description="Maintained for backward compatibility; ignored")
+    recv_window: Optional[int] = Field(default=5000, description="Maintained for backward compatibility; ignored")
     api_key: Optional[str] = Field(default=None, description="Optional API key override")
     api_secret: Optional[str] = Field(default=None, description="Optional API secret override")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "dex": DEFAULT_DEX,
+                "capital": "100",
+                "spot_symbol": "ASTERUSDT",
+                "futures_symbol": "ASTERUSDT",
+                "batch_quote": "10",
+                "batch_delay": 1,
+                "mode": DEFAULT_MODE,
+                "recv_window": 5000,
+            }
+        }
+    )
 
 
 class BotStartResponse(BaseModel):
