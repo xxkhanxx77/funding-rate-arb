@@ -153,6 +153,145 @@ def _resolve_credentials(dex_name: str, overrides: Optional[Dict[str, str]] = No
     return {"api_key": api_key, "api_secret": api_secret}
 
 
+def _summarize_account_status(dex_name: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    if not snapshot or "error" in snapshot:
+        return {
+            "dex": dex_name,
+            "error": snapshot.get("error") if isinstance(snapshot, dict) else "snapshot unavailable",
+        }
+
+    summary = snapshot.get("summary", {}) or {}
+    hedging = snapshot.get("hedging", {}) or {}
+    funding = snapshot.get("funding", {}) or {}
+    mark_data = snapshot.get("mark_price", {}) or {}
+
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    spot_holdings: List[Dict[str, Any]] = []
+    for asset in summary.get("spot", {}).get("balance", []) or []:
+        free = _safe_float(asset.get("free"))
+        locked = _safe_float(asset.get("locked"))
+        if (free or 0) > 0 or (locked or 0) > 0:
+            spot_holdings.append({
+                "asset": asset.get("asset", "?"),
+                "free": free,
+                "locked": locked,
+            })
+
+    futures_positions: List[Dict[str, Any]] = []
+    for pos in summary.get("futures", {}).get("positions", []) or []:
+        futures_positions.append({
+            "symbol": pos.get("symbol", "?"),
+            "position_amt": pos.get("positionAmt") or pos.get("position_amt"),
+            "unrealized_pnl": pos.get("unRealizedProfit") or pos.get("unrealized_pnl"),
+        })
+
+    hedge_ratio = (_safe_float(hedging.get("average_efficiency")) or 0.0) * 100
+    strategy_active = hedging.get("total_pairs", 0) > 0 and hedge_ratio >= 80
+    strategy_status = "🟢 Active" if strategy_active else "⭕ Inactive"
+    health = "HEALTHY" if 95 <= hedge_ratio <= 105 else "NEEDS_ATTENTION"
+
+    funding_totals = funding.get("funding_totals") or {}
+    funding_accumulated = _safe_float(funding_totals.get("30_days"))
+
+    effective_rates = funding.get("effective_rates") or {}
+    projections = funding.get("projections") or {}
+
+    apy_analysis = {
+        "seven_day_rate_percent": _safe_float(effective_rates.get("7_day_rate_percent")),
+        "thirty_day_rate_percent": _safe_float(effective_rates.get("30_day_rate_percent")),
+        "monthly_projection_usd": _safe_float(projections.get("monthly_projected")),
+        "yearly_projection_usd": _safe_float(projections.get("yearly_projected")),
+    }
+
+    mark_overview: Dict[str, Any] = {}
+    if isinstance(mark_data, dict):
+        if "error" in mark_data:
+            mark_overview["error"] = mark_data.get("error")
+        else:
+            mark_overview = {
+                "mark_price": _safe_float(mark_data.get("mark_price") or mark_data.get("markPrice")),
+                "last_funding_rate_percent": _safe_float(mark_data.get("last_funding_rate_percent")),
+                "estimated_apy_percent": _safe_float(mark_data.get("estimated_apy_percent") or mark_data.get("net_estimated_apy_percent")),
+                "next_funding_time": mark_data.get("next_funding_time_iso") or mark_data.get("next_funding_time"),
+            }
+
+    return {
+        "dex": dex_name,
+        "spot_holdings": spot_holdings,
+        "futures_positions": futures_positions,
+        "strategy_status": strategy_status,
+        "health": health,
+        "hedge_ratio_percent": hedge_ratio,
+        "funding_accumulated_30d_usd": funding_accumulated,
+        "apy_analysis": apy_analysis,
+        "mark_price_overview": mark_overview,
+    }
+
+
+def _print_account_status(dex_name: str, snapshot: Dict[str, Any]) -> None:
+    summary = _summarize_account_status(dex_name, snapshot)
+    if not summary or summary.get("error"):
+        return
+
+    print(f"\n=== {dex_name.upper()} Account Status ===")
+    spot_holdings = summary.get("spot_holdings", [])
+    if spot_holdings:
+        print("Spot Holdings:")
+        for holding in spot_holdings:
+            free = holding.get("free")
+            locked = holding.get("locked")
+            free_str = f"{free:.6f}" if free is not None else "0"
+            if locked is not None and locked > 0:
+                print(f"  {holding.get('asset', '?')}: {free_str} (locked: {locked:.6f})")
+            else:
+                print(f"  {holding.get('asset', '?')}: {free_str}")
+
+    futures_positions = summary.get("futures_positions", [])
+    if futures_positions:
+        print("Futures Positions:")
+        for pos in futures_positions:
+            print(f"  {pos.get('symbol', '?')}: {pos.get('position_amt')} (PnL: ${pos.get('unrealized_pnl')})")
+
+    print(f"Strategy: {summary.get('strategy_status')}")
+    print(f"Health: {summary.get('health')}")
+    print(f"Hedge Ratio: {summary.get('hedge_ratio_percent', 0):.2f}%")
+
+    if summary.get("funding_accumulated_30d_usd") is not None:
+        print(f"Funding Accumulated (30d): ${summary['funding_accumulated_30d_usd']:.4f}")
+
+    apy = summary.get("apy_analysis", {})
+    if any(value is not None for value in apy.values()):
+        print("APY Analysis:")
+        if apy.get("seven_day_rate_percent") is not None:
+            print(f"  7d Effective Rate: {apy['seven_day_rate_percent']:.2f}%")
+        if apy.get("thirty_day_rate_percent") is not None:
+            print(f"  30d Effective Rate: {apy['thirty_day_rate_percent']:.2f}%")
+        if apy.get("monthly_projection_usd") is not None:
+            print(f"  Monthly Projection: ${apy['monthly_projection_usd']:.2f}")
+        if apy.get("yearly_projection_usd") is not None:
+            print(f"  Yearly Projection: ${apy['yearly_projection_usd']:.2f}")
+
+    mark = summary.get("mark_price_overview", {})
+    if mark:
+        print("Mark Price Overview:")
+        if mark.get("error"):
+            print(f"  Mark Price: unavailable ({mark['error']})")
+        else:
+            if mark.get("mark_price") is not None:
+                print(f"  Mark Price: {mark['mark_price']:.6f}")
+            if mark.get("last_funding_rate_percent") is not None:
+                print(f"  Last Funding Rate: {mark['last_funding_rate_percent']:.4f}%")
+            if mark.get("estimated_apy_percent") is not None:
+                print(f"  Estimated Funding APY: {mark['estimated_apy_percent']:.2f}%")
+            if mark.get("next_funding_time"):
+                print(f"  Next Funding: {mark['next_funding_time']}")
+    print(f"=== {dex_name.upper()} Ready ===\n")
+
 def _ensure_dex_resources(
     dex_name: str,
     credentials: Dict[str, str],
@@ -235,9 +374,11 @@ def _refresh_monitor_snapshot(dex_name: str) -> Dict[str, Any]:
             "funding": funding,
             "mark_price": mark_price,
         }
+        snapshot["account_status"] = _summarize_account_status(dex_name, snapshot)
         with monitor_data_lock:
             monitor_data[dex_name] = snapshot
         _log_snapshot(dex_name, snapshot)
+        _print_account_status(dex_name, snapshot)
         resource["last_error"] = None
         return snapshot
     except Exception as exc:  # pylint: disable=broad-except
@@ -459,95 +600,7 @@ async def startup_event() -> None:
             logger.warning("Initial snapshot failed for %s: %s", dex_name, exc)
             continue
 
-        print(f"\n=== {dex_name.upper()} Account Status on Startup ===")
-        spot_balances = snapshot.get("summary", {}).get("spot", {}).get("balance", [])
-        if spot_balances:
-            print("Spot Holdings:")
-            for asset in spot_balances:
-                free = float(asset.get("free", 0))
-                locked = float(asset.get("locked", 0))
-                if free > 0 or locked > 0:
-                    print(f"  {asset.get('asset', '?')}: {free:.6f}")
-
-        futures_positions = snapshot.get("summary", {}).get("futures", {}).get("positions", [])
-        if futures_positions:
-            print("Futures Positions:")
-            for pos in futures_positions:
-                amt = pos.get("positionAmt") or pos.get("position_amt", 0)
-                pnl = pos.get("unRealizedProfit") or pos.get("unrealized_pnl", 0)
-                print(f"  {pos.get('symbol', '?')}: {amt} (PnL: ${pnl})")
-
-        hedge = snapshot.get("hedging", {})
-        ratio = float(hedge.get("average_efficiency", 0)) * 100
-        status = "🟢 Active" if hedge.get("total_pairs", 0) > 0 and ratio >= 80 else "⭕ Inactive"
-        health = "HEALTHY" if 95 <= ratio <= 105 else "NEEDS_ATTENTION"
-        print(f"Strategy: {status}")
-        print(f"Health: {health}")
-        print(f"Hedge Ratio: {ratio:.2f}%")
-        funding_data = snapshot.get("funding", {}) or {}
-        funding_totals = funding_data.get("funding_totals") or {}
-        if funding_totals:
-            total_30d = float(funding_totals.get("30_days", 0))
-            print(f"Funding Accumulated (30d): ${total_30d:.4f}")
-
-        if funding_data and "error" not in funding_data:
-            effective_rates = funding_data.get("effective_rates") or {}
-            projections = funding_data.get("projections") or {}
-
-            if effective_rates or projections:
-                print("APY Analysis:")
-
-                seven_rate = effective_rates.get("7_day_rate_percent")
-                if seven_rate is not None:
-                    print(
-                        f"  7d Effective Rate: {_format_percentage(float(seven_rate) / 100)}"
-                    )
-
-                thirty_rate = effective_rates.get("30_day_rate_percent")
-                if thirty_rate is not None:
-                    print(
-                        f"  30d Effective Rate: {_format_percentage(float(thirty_rate) / 100)}"
-                    )
-                    print(f"  Estimated APY: {float(thirty_rate):.2f}%")
-                elif seven_rate is not None:
-                    print(f"  Estimated APY: {float(seven_rate):.2f}%")
-
-                monthly_projection = projections.get("monthly_projected")
-                if monthly_projection is not None:
-                    print(
-                        f"  Monthly Projection: {_format_currency(monthly_projection)}"
-                    )
-
-                yearly_projection = projections.get("yearly_projected")
-                if yearly_projection is not None:
-                    print(
-                        f"  Yearly Projection: {_format_currency(yearly_projection)}"
-                    )
-
-        mark_data = snapshot.get("mark_price", {}) or {}
-        if mark_data:
-            if "error" in mark_data:
-                print(f"Mark Price: unavailable ({mark_data['error']})")
-            else:
-                print("Mark Price Overview:")
-
-                mark_price_value = mark_data.get("mark_price")
-                if mark_price_value is not None:
-                    print(f"  Mark Price: {float(mark_price_value):.6f}")
-
-                last_rate_percent = mark_data.get("last_funding_rate_percent")
-                if last_rate_percent is not None:
-                    print(f"  Last Funding Rate: {float(last_rate_percent):.4f}%")
-
-                estimated_apy_percent = mark_data.get("estimated_apy_percent")
-                if estimated_apy_percent is not None:
-                    print(f"  Estimated Funding APY: {float(estimated_apy_percent):.2f}%")
-
-                next_funding = mark_data.get("next_funding_time_iso")
-                if next_funding:
-                    print(f"  Next Funding: {next_funding}")
-
-        print(f"=== {dex_name.upper()} Ready ===\n")
+        _print_account_status(dex_name, snapshot)
 
     if dex_resources:
         _start_monitor_thread()
@@ -937,6 +990,15 @@ async def get_monitor_simple(dex_name: str) -> PlainTextResponse:
     snapshot = await get_monitor_snapshot(dex_name)
     report = _build_simple_report(dex_name.lower(), snapshot)
     return PlainTextResponse(report)
+
+
+@app.get("/monitor/{dex_name}/status")
+async def get_monitor_status(dex_name: str) -> Dict[str, Any]:
+    snapshot = await get_monitor_snapshot(dex_name)
+    status = snapshot.get("account_status")
+    if not status:
+        status = _summarize_account_status(dex_name.lower(), snapshot)
+    return status
 
 
 @app.get("/apy/{dex_name}/simple", response_class=PlainTextResponse)
