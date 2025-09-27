@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from .config import ConfigManager
 from dexes.factory import DexFactory
+from dexes.asterdex.rebalancer import rebalance_delta_neutral
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,13 @@ config_manager = ConfigManager()
 DEFAULT_DEX = "asterdex"
 DEFAULT_MODE = "buy_spot_short_futures"
 VALID_MODES = {"buy_spot_short_futures", "sell_spot_long_futures"}
+
+AUTO_REBALANCE_ENABLED = os.getenv("AUTO_REBALANCE_ENABLED", "true").lower() not in {"0", "false", "no"}
+AUTO_REBALANCE_MARGIN_THRESHOLD = Decimal(os.getenv("AUTO_REBALANCE_MARGIN_THRESHOLD", "0.08"))
+AUTO_REBALANCE_LEVERAGE_THRESHOLD = Decimal(os.getenv("AUTO_REBALANCE_LEVERAGE_THRESHOLD", "3"))
+AUTO_REBALANCE_COOLDOWN_SECONDS = int(os.getenv("AUTO_REBALANCE_COOLDOWN_SECONDS", "300"))
+AUTO_REBALANCE_THRESHOLD_PERCENT = Decimal(os.getenv("AUTO_REBALANCE_THRESHOLD_PERCENT", "5"))
+AUTO_REBALANCE_MIN_ADJUST_USD = Decimal(os.getenv("AUTO_REBALANCE_MIN_ADJUST_USD", "10"))
 
 
 def _get_unwind_mode(mode: str) -> Optional[str]:
@@ -140,6 +148,29 @@ class BalanceReallocateResponse(BaseModel):
     spot_after: Optional[str] = None
     futures_after: Optional[str] = None
     transfer: Optional[Dict[str, Any]] = None
+
+
+class DeltaRebalanceRequest(BaseModel):
+    dex: Optional[str] = Field(default=None, description="DEX identifier, defaults to configured DEX")
+    symbol: Optional[str] = Field(default=None, description="Primary trading symbol, e.g. 'ASTERUSDT'")
+    threshold_percent: float = Field(default=5.0, ge=0.0, description="Rebalance trigger percentage based on exposure difference")
+    min_adjust_usd: float = Field(default=10.0, ge=0.0, description="Minimum USD notional to adjust when rebalancing")
+
+
+class DeltaRebalanceResponse(BaseModel):
+    status: str
+    scenario: Optional[str] = None
+    reason: Optional[str] = None
+    imbalance_percent_before: Optional[str] = None
+    imbalance_percent_after: Optional[str] = None
+    actions: Optional[List[Dict[str, Any]]] = None
+    snapshot: Optional[Dict[str, Any]] = None
+    snapshot_before: Optional[Dict[str, Any]] = None
+    snapshot_after: Optional[Dict[str, Any]] = None
+    threshold_percent: Optional[str] = None
+
+    class Config:
+        extra = "allow"
 
 
 class BotStatus(BaseModel):
@@ -382,6 +413,8 @@ def _ensure_dex_resources(
                 resource["default_symbol"] = default_symbol
             if mark_price_interval:
                 resource["mark_price_interval"] = mark_price_interval
+            resource.setdefault("auto_rebalance_cooldown", AUTO_REBALANCE_COOLDOWN_SECONDS)
+            resource.setdefault("last_auto_rebalance", 0.0)
             return
         try:
             monitor = DexFactory.create_monitor(dex_name, **credentials)
@@ -394,6 +427,8 @@ def _ensure_dex_resources(
                 "mark_price_interval": interval,
                 "mark_price_last_fetch": 0.0,
                 "mark_price_cache": None,
+                "last_auto_rebalance": 0.0,
+                "auto_rebalance_cooldown": AUTO_REBALANCE_COOLDOWN_SECONDS,
             }
             logger.info("Initialized %s monitor", dex_name)
         except Exception as exc:  # pylint: disable=broad-except
@@ -457,6 +492,10 @@ def _refresh_monitor_snapshot(dex_name: str) -> Dict[str, Any]:
         _log_snapshot(dex_name, snapshot)
         _print_account_status(dex_name, snapshot)
         resource["last_error"] = None
+        try:
+            _maybe_auto_rebalance(dex_name, resource, snapshot)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Auto rebalance evaluation failed for %s: %s", dex_name.upper(), exc)
         return snapshot
     except Exception as exc:  # pylint: disable=broad-except
         error_snapshot = {
@@ -537,6 +576,111 @@ def _log_snapshot(dex_name: str, snapshot: Dict[str, Any]) -> None:
     except Exception as exc:  # pylint: disable=broad-except
         logger.debug("Failed to log snapshot for %s: %s", dex_name, exc)
 
+
+def _to_decimal_or_none(value: Any) -> Optional[Decimal]:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _has_active_futures_position(snapshot: Dict[str, Any]) -> bool:
+    summary = snapshot.get("summary") or {}
+    futures = summary.get("futures") or {}
+    positions = futures.get("positions") or []
+
+    if isinstance(positions, dict):
+        positions = positions.get("positions", [])
+
+    for pos in positions:
+        qty = pos.get("positionAmt") or pos.get("position_amt") or pos.get("qty")
+        amount = _to_decimal_or_none(qty)
+        if amount is not None and amount != 0:
+            return True
+    return False
+
+
+def _assess_liquidation_risk(snapshot: Dict[str, Any]) -> Tuple[bool, str, Dict[str, str]]:
+    if not _has_active_futures_position(snapshot):
+        return False, "no_active_positions", {}
+
+    risk = snapshot.get("risk") or {}
+    margin_ratio = _to_decimal_or_none(risk.get("margin_ratio"))
+    leverage = _to_decimal_or_none(risk.get("effective_leverage"))
+    total_notional = _to_decimal_or_none(risk.get("total_notional_exposure"))
+
+    metrics: Dict[str, str] = {}
+    if margin_ratio is not None:
+        metrics["margin_ratio"] = str(margin_ratio)
+    if leverage is not None:
+        metrics["effective_leverage"] = str(leverage)
+    if total_notional is not None:
+        metrics["total_notional_exposure"] = str(total_notional)
+
+    if total_notional is None or total_notional <= 0:
+        return False, "no_notional_exposure", metrics
+
+    if margin_ratio is not None and margin_ratio <= AUTO_REBALANCE_MARGIN_THRESHOLD:
+        return True, f"margin ratio {margin_ratio}", metrics
+
+    if leverage is not None and leverage >= AUTO_REBALANCE_LEVERAGE_THRESHOLD:
+        return True, f"effective leverage {leverage}", metrics
+
+    return False, "within_limits", metrics
+
+
+def _maybe_auto_rebalance(dex_name: str, resource: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+    if not AUTO_REBALANCE_ENABLED:
+        return
+
+    if dex_name.lower() != "asterdex":
+        return
+
+    monitor = resource.get("monitor")
+    if not monitor or not hasattr(monitor, "dex"):
+        return
+
+    should_rebalance, reason, metrics = _assess_liquidation_risk(snapshot)
+    if not should_rebalance:
+        return
+
+    now_ts = time.time()
+    cooldown = resource.get("auto_rebalance_cooldown", AUTO_REBALANCE_COOLDOWN_SECONDS)
+    last_ts = resource.get("last_auto_rebalance", 0.0)
+    if last_ts and now_ts - last_ts < cooldown:
+        logger.debug(
+            "%s auto-rebalance skipped due to cooldown (remaining=%ss)",
+            dex_name.upper(),
+            int(cooldown - (now_ts - last_ts)),
+        )
+        return
+
+    cfg = config_manager.load_config()
+    spot_symbol = (resource.get("default_symbol") or cfg.spot_symbol or "ASTERUSDT").upper()
+    futures_symbol = (cfg.futures_symbol or spot_symbol).upper()
+
+    try:
+        result = rebalance_delta_neutral(
+            monitor.dex,
+            spot_symbol,
+            futures_symbol,
+            threshold_percent=AUTO_REBALANCE_THRESHOLD_PERCENT,
+            min_adjust_usd=AUTO_REBALANCE_MIN_ADJUST_USD,
+        )
+        logger.warning(
+            "Auto delta rebalance triggered for %s due to %s | status=%s | metrics=%s",
+            dex_name.upper(),
+            reason,
+            result.get("status"),
+            metrics,
+        )
+        resource["last_auto_rebalance"] = now_ts
+        resource["last_auto_rebalance_reason"] = reason
+        resource["last_auto_rebalance_result"] = result
+    except Exception as exc:  # pylint: disable=broad-except
+        resource["last_auto_rebalance"] = now_ts
+        resource["last_auto_rebalance_error"] = str(exc)
+        logger.error("Auto delta rebalance failed for %s: %s", dex_name.upper(), exc)
 
 def _build_simple_report(dex_name: str, snapshot: Dict[str, Any]) -> str:
     if "error" in snapshot:
@@ -1373,6 +1517,50 @@ async def rebalance_wallets(request: BalanceReallocateRequest) -> BalanceRealloc
             "response": transfer_response,
         },
     )
+
+
+@app.post("/rebalance/delta", response_model=DeltaRebalanceResponse)
+async def rebalance_delta(request: DeltaRebalanceRequest) -> DeltaRebalanceResponse:
+    dex_name = _normalize_dex_name(request.dex)
+
+    if dex_name != "asterdex":
+        raise HTTPException(status_code=400, detail=f"Delta-neutral rebalance currently supports only AsterDex (requested '{dex_name}')")
+
+    cfg = config_manager.load_config()
+    spot_symbol = (request.symbol or cfg.spot_symbol or "ASTERUSDT").upper()
+    futures_symbol = (cfg.futures_symbol or spot_symbol).upper()
+
+    try:
+        threshold = Decimal(str(request.threshold_percent))
+        min_adjust = Decimal(str(request.min_adjust_usd))
+    except (InvalidOperation, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid threshold or minimum adjustment value")
+
+    try:
+        credentials = _resolve_credentials(dex_name)
+        client = DexFactory.create_client(
+            dex_name,
+            api_key=credentials["api_key"],
+            api_secret=credentials["api_secret"],
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    result = rebalance_delta_neutral(
+        client,
+        spot_symbol,
+        futures_symbol,
+        threshold_percent=threshold,
+        min_adjust_usd=min_adjust,
+    )
+
+    result.setdefault("threshold_percent", str(threshold))
+    if "imbalance_percent" in result and "imbalance_percent_before" not in result:
+        result["imbalance_percent_before"] = result["imbalance_percent"]
+
+    return DeltaRebalanceResponse(**result)
 
 
 @app.get("/monitor/{dex_name}/simple", response_class=PlainTextResponse)

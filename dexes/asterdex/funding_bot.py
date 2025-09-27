@@ -76,6 +76,12 @@ class AsterDexFundingBot(BaseFundingBot):
         if not spot_symbol_info or not futures_symbol_info:
             raise RuntimeError("Failed to get symbol information")
 
+        try:
+            self.dex.set_leverage(self.futures_symbol, 1)
+            logger.info("Set %s futures leverage to 1x", self.futures_symbol)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Unable to set leverage to 1x for %s: %s", self.futures_symbol, exc)
+
         # Get initial price for calculations
         initial_spot_price = self.dex.get_spot_price(self.spot_symbol)
         theoretical_base_qty = self.capital_usd / initial_spot_price
