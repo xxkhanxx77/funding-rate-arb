@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Multi-DEX FastAPI server for funding-fee arbitrage bots."""
 
+import asyncio
 import logging
 import os
 import threading
@@ -10,7 +11,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -18,6 +19,49 @@ from .config import ConfigManager
 from dexes.factory import DexFactory
 
 logger = logging.getLogger(__name__)
+
+
+def _load_env_file(env_file: Optional[str] = None) -> None:
+    """Load environment variables from a .env file if present."""
+    candidate = env_file or os.getenv("FUNDING_ENV_FILE", ".env")
+    search_paths: List[str] = []
+
+    if candidate:
+        if os.path.isabs(candidate):
+            search_paths.append(candidate)
+        else:
+            base_dirs = {
+                os.getcwd(),
+                os.path.dirname(__file__),
+                os.path.dirname(os.path.dirname(__file__)),
+            }
+            for base in base_dirs:
+                search_paths.append(os.path.abspath(os.path.join(base, candidate)))
+
+    for path in search_paths:
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+            logger.info("Loaded environment variables from %s", path)
+            break
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to load environment file %s: %s", path, exc)
+
+
+_load_env_file()
 
 # -----------------------------------------------------------------------------
 # Global state
@@ -32,6 +76,15 @@ config_manager = ConfigManager()
 DEFAULT_DEX = "asterdex"
 DEFAULT_MODE = "buy_spot_short_futures"
 VALID_MODES = {"buy_spot_short_futures", "sell_spot_long_futures"}
+
+
+def _get_unwind_mode(mode: str) -> Optional[str]:
+    """Return the opposite trading mode used to unwind an existing position."""
+    if mode == "buy_spot_short_futures":
+        return "sell_spot_long_futures"
+    if mode == "sell_spot_long_futures":
+        return "buy_spot_short_futures"
+    return None
 
 bot_jobs: Dict[str, Dict[str, Any]] = {}
 bot_results: Dict[str, Dict[str, Any]] = {}
@@ -112,6 +165,30 @@ class StopResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     timestamp: str
+
+
+class UnwindPositionsRequest(BaseModel):
+    dex: Optional[str] = Field(default=None, description="DEX identifier, defaults to configured DEX")
+    symbol: Optional[str] = Field(default=None, description="Primary trading symbol, e.g. 'ASTERUSDT'")
+    spot_symbol: Optional[str] = Field(default=None, description="Override spot symbol if different from symbol")
+    futures_symbol: Optional[str] = Field(default=None, description="Override futures symbol if different from symbol")
+    api_key: Optional[str] = Field(default=None, description="Optional API key override")
+    api_secret: Optional[str] = Field(default=None, description="Optional API secret override")
+
+
+def _merge_unwind_request(
+    base: Optional[UnwindPositionsRequest],
+    **overrides: Optional[str],
+) -> UnwindPositionsRequest:
+    data: Dict[str, Any] = {}
+    if base is not None:
+        data.update({k: v for k, v in base.dict().items() if v not in {None, ""}})
+
+    for key, value in overrides.items():
+        if value not in {None, ""}:
+            data[key] = value
+
+    return UnwindPositionsRequest(**data)
 
 
 # -----------------------------------------------------------------------------
@@ -657,7 +734,10 @@ async def dex_info(dex_name: str) -> Dict[str, Any]:
 
 
 @app.post("/start", response_model=BotStartResponse)
-async def start_bot(request: BotStartRequest, background_tasks: BackgroundTasks) -> BotStartResponse:
+async def start_bot(
+    background_tasks: BackgroundTasks,
+    request: BotStartRequest = Body(default_factory=BotStartRequest),
+) -> BotStartResponse:
     dex_name = _normalize_dex_name(request.dex)
     if dex_name not in DexFactory.list_supported_dexes():
         raise HTTPException(status_code=400, detail=f"Unsupported DEX '{dex_name}'")
@@ -779,6 +859,316 @@ async def stop_bot(job_id: str) -> StopResponse:
     return StopResponse(
         message="Stop requested, but trading bot cannot be safely interrupted once submitted",
         recommendation="Allow the current job to finish, then run the opposite mode to unwind positions",
+    )
+
+
+def _perform_unwind(  # noqa: PLR0915
+    dex_name: str,
+    spot_symbol: str,
+    futures_symbol: str,
+    credentials: Dict[str, str],
+) -> Dict[str, Any]:
+    if dex_name != "asterdex":
+        raise HTTPException(status_code=400, detail="Automatic unwind currently supports only AsterDex")
+
+    client = DexFactory.create_client(
+        dex_name,
+        api_key=credentials["api_key"],
+        api_secret=credentials["api_secret"],
+    )
+
+    spot_info = client.get_symbol_info(spot_symbol, "spot")
+    futures_info = client.get_symbol_info(futures_symbol, "futures")
+    if not spot_info or not futures_info:
+        raise HTTPException(status_code=400, detail=f"Unable to load symbol metadata for {spot_symbol}")
+
+    base_asset = spot_info.get("baseAsset") or spot_symbol.replace("USDT", "")
+
+    spot_balance = client.get_spot_balance()
+    base_balance = Decimal("0")
+    for asset in spot_balance:
+        if asset.get("asset") == base_asset:
+            free = Decimal(str(asset.get("free", "0")))
+            locked = Decimal(str(asset.get("locked", "0")))
+            base_balance = free + locked
+            break
+
+    futures_positions = client.get_futures_positions()
+    futures_amt = Decimal("0")
+    futures_side = None
+    for pos in futures_positions:
+        if pos.get("symbol") == futures_symbol:
+            amt = Decimal(str(pos.get("positionAmt", "0")))
+            if amt != 0:
+                futures_amt = abs(amt)
+                futures_side = "short" if amt < 0 else "long"
+            break
+
+    if base_balance <= 0 and futures_amt <= 0:
+        return {
+            "status": "noop",
+            "message": f"No open positions detected for {spot_symbol}",
+            "spot_balance": "0",
+            "futures_position": "0",
+        }
+
+    response: Dict[str, Any] = {
+        "status": "in_progress",
+        "spot_symbol": spot_symbol,
+        "futures_symbol": futures_symbol,
+        "base_asset": base_asset,
+        "actions": [],
+    }
+
+    # Handle spot unwind
+    if base_balance > 0:
+        spot_step, spot_min_qty = client.get_lot_size_info(spot_symbol, "spot")
+        sell_qty = client._floor_to_step(base_balance, spot_step)
+
+        if sell_qty <= 0:
+            raise HTTPException(status_code=400, detail=f"Spot balance {base_balance} is below tradable step size {spot_step}")
+        if sell_qty < spot_min_qty:
+            raise HTTPException(status_code=400, detail=f"Spot balance {base_balance} below minimum quantity {spot_min_qty}")
+
+        spot_order = client.place_spot_market_sell(spot_symbol, sell_qty)
+        response["actions"].append({
+            "type": "spot_sell",
+            "quantity": client._decimal_to_str(sell_qty),
+            "order": spot_order,
+        })
+
+    # Handle futures unwind
+    if futures_amt > 0 and futures_side:
+        futures_step, futures_min_qty = client.get_lot_size_info(futures_symbol, "futures")
+        futures_qty = client._floor_to_step(futures_amt, futures_step)
+
+        if futures_qty <= 0:
+            raise HTTPException(status_code=400, detail=f"Futures position {futures_amt} is below tradable step size {futures_step}")
+        if futures_qty < futures_min_qty:
+            raise HTTPException(status_code=400, detail=f"Futures position {futures_amt} below minimum quantity {futures_min_qty}")
+
+        futures_price = client.get_futures_price(futures_symbol)
+        futures_notional = futures_qty * futures_price
+        futures_min_notional = client.get_min_notional(futures_symbol, "futures")
+        if futures_min_notional > 0 and futures_notional < futures_min_notional:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Futures position notional {futures_notional} is below minimum {futures_min_notional}. "
+                    "Increase position size before attempting to unwind."
+                ),
+            )
+
+        if futures_side == "short":
+            futures_order = client.place_futures_market_long(futures_symbol, futures_qty)
+            action = "futures_buy"
+        else:
+            futures_order = client.place_futures_market_short(futures_symbol, futures_qty)
+            action = "futures_sell"
+
+        response["actions"].append({
+            "type": action,
+            "quantity": client._decimal_to_str(futures_qty),
+            "order": futures_order,
+        })
+
+    response["status"] = "completed"
+    return response
+
+
+async def _execute_unwind(request: UnwindPositionsRequest) -> Dict[str, Any]:
+    dex_name = _normalize_dex_name(request.dex)
+    symbol = request.symbol or request.spot_symbol or request.futures_symbol
+    if not symbol:
+        cfg = config_manager.load_config()
+        symbol = getattr(cfg, "spot_symbol", "ASTERUSDT")
+
+    spot_symbol = (request.spot_symbol or symbol).upper()
+    futures_symbol = (request.futures_symbol or symbol).upper()
+
+    try:
+        info = DexFactory.get_dex_info(dex_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    env_prefix = info.get("env_prefix", "ASTERDEX")
+    overrides = {
+        "api_key": request.api_key or os.getenv(f"{env_prefix}_API_KEY"),
+        "api_secret": request.api_secret or os.getenv(f"{env_prefix}_API_SECRET"),
+    }
+    overrides = {key: value for key, value in overrides.items() if value}
+
+    try:
+        credentials = _resolve_credentials(dex_name, overrides)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        result = await asyncio.to_thread(
+            _perform_unwind,
+            dex_name,
+            spot_symbol,
+            futures_symbol,
+            credentials,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Unwind operation failed for %s: %s", spot_symbol, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    try:
+        _refresh_monitor_snapshot(dex_name)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Snapshot refresh failed after unwind for %s: %s", dex_name, exc)
+
+    return result
+
+
+@app.post(
+    "/unwind",
+    response_model=Dict[str, Any],
+    summary="Unwind positions",
+    description=(
+        "Close both spot and futures positions for a symbol. "
+        "To issue the minimal call, use: \n"
+        "`curl -X POST http://localhost:8000/unwind/ASTERUSDT -H 'Content-Type: application/json' -d '{}'`"
+    ),
+)
+async def unwind_positions(
+    request: Optional[UnwindPositionsRequest] = Body(default=None, example={}),
+    dex: Optional[str] = None,
+    symbol: Optional[str] = None,
+    spot_symbol: Optional[str] = None,
+    futures_symbol: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> Dict[str, Any]:
+    combined = _merge_unwind_request(
+        request,
+        dex=dex,
+        symbol=symbol,
+        spot_symbol=spot_symbol,
+        futures_symbol=futures_symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+    return await _execute_unwind(combined)
+
+
+@app.post(
+    "/unwind/{path_symbol}",
+    response_model=Dict[str, Any],
+    summary="Unwind positions by symbol",
+    description=(
+        "Convenience endpoint for closing the book on a specific symbol via the path parameter. "
+        "Example: `curl -X POST http://localhost:8000/unwind/ASTERUSDT -H 'Content-Type: application/json' -d '{}'`."
+    ),
+)
+async def unwind_positions_by_symbol(
+    path_symbol: str,
+    request: Optional[UnwindPositionsRequest] = Body(default=None, example={}),
+    dex: Optional[str] = None,
+    spot_symbol: Optional[str] = None,
+    futures_symbol: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> Dict[str, Any]:
+    combined = _merge_unwind_request(
+        request,
+        symbol=path_symbol,
+        dex=dex,
+        spot_symbol=spot_symbol,
+        futures_symbol=futures_symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+    )
+    return await _execute_unwind(combined)
+
+
+@app.post("/jobs/{job_id}/unwind", response_model=BotStartResponse)
+async def unwind_bot(job_id: str, background_tasks: BackgroundTasks) -> BotStartResponse:
+    with bot_lock:
+        original_job = bot_jobs.get(job_id)
+
+    if not original_job:
+        raise HTTPException(status_code=404, detail="Job ID not found")
+
+    original_status = original_job.get("status")
+    if original_status == "running":
+        raise HTTPException(status_code=400, detail="Cannot unwind while the original job is running")
+
+    dex_name = original_job.get("dex")
+    if not dex_name:
+        raise HTTPException(status_code=500, detail="Original job missing DEX information")
+
+    original_config = original_job.get("config") or {}
+    original_mode = original_config.get("mode", DEFAULT_MODE)
+    unwind_mode = _get_unwind_mode(original_mode)
+
+    if not unwind_mode:
+        raise HTTPException(status_code=400, detail=f"Unsupported mode '{original_mode}' for unwind")
+
+    capital_usd = _parse_decimal(original_config.get("capital_usd", "0"), "capital_usd")
+    batch_quote = _parse_decimal(original_config.get("batch_quote", "0"), "batch_quote")
+    if capital_usd <= 0 or batch_quote <= 0:
+        raise HTTPException(status_code=400, detail="Original job configuration lacks valid capital or batch quote")
+
+    spot_symbol = original_config.get("spot_symbol") or "ASTERUSDT"
+    futures_symbol = original_config.get("futures_symbol") or spot_symbol
+    try:
+        batch_delay = float(original_config.get("batch_delay", 1.0))
+    except (TypeError, ValueError):
+        batch_delay = 1.0
+
+    try:
+        credentials = _resolve_credentials(dex_name)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    unwind_job_id = str(uuid.uuid4())
+    created_time = datetime.now().isoformat()
+    bot_kwargs = {
+        "capital_usd": capital_usd,
+        "spot_symbol": spot_symbol,
+        "futures_symbol": futures_symbol,
+        "batch_quote": batch_quote,
+        "batch_delay": batch_delay,
+        "mode": unwind_mode,
+    }
+
+    unwind_config = {
+        "capital_usd": str(capital_usd),
+        "spot_symbol": spot_symbol,
+        "futures_symbol": futures_symbol,
+        "batch_quote": str(batch_quote),
+        "batch_delay": str(batch_delay),
+        "mode": unwind_mode,
+        "parent_job_id": job_id,
+    }
+
+    unwind_summary = {
+        "job_id": unwind_job_id,
+        "dex": dex_name,
+        "status": "pending",
+        "config": unwind_config,
+        "created_time": created_time,
+        "start_time": None,
+        "end_time": None,
+        "error": None,
+        "parent_job_id": job_id,
+        "job_type": "unwind",
+    }
+
+    with bot_lock:
+        bot_jobs[unwind_job_id] = unwind_summary
+
+    background_tasks.add_task(_run_bot, unwind_job_id, dex_name, bot_kwargs, credentials)
+
+    return BotStartResponse(
+        job_id=unwind_job_id,
+        status="started",
+        message="Unwind job scheduled; positions will be closed using the opposite mode",
     )
 
 

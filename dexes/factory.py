@@ -6,6 +6,7 @@ Supports multiple DEX implementations
 
 import os
 import logging
+import inspect
 from typing import Dict, Any, Optional, Tuple, List
 from decimal import Decimal
 
@@ -55,12 +56,40 @@ class DexFactory:
         if not api_key or not api_secret:
             raise RuntimeError(f"Missing API credentials for {dex_name}. Set {env_prefix}_API_KEY and {env_prefix}_API_SECRET")
 
-        # Create client instance
-        client_kwargs = {
+        # Create client instance; ignore kwargs the client does not accept
+        raw_client_kwargs = {
             "api_key": api_key,
             "api_secret": api_secret,
             **{k: v for k, v in kwargs.items() if k not in ["api_key", "api_secret"]}
         }
+
+        signature = inspect.signature(client_class.__init__)
+        accepts_var_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+
+        if accepts_var_kwargs:
+            client_kwargs = raw_client_kwargs
+        else:
+            accepted_params = {
+                name
+                for name, param in signature.parameters.items()
+                if name != "self" and param.kind != inspect.Parameter.VAR_POSITIONAL
+            }
+            client_kwargs = {
+                key: value
+                for key, value in raw_client_kwargs.items()
+                if key in accepted_params
+            }
+
+            ignored_keys = set(raw_client_kwargs) - set(client_kwargs)
+            if ignored_keys:
+                logger.debug(
+                    "Ignoring unsupported client kwargs for %s: %s",
+                    client_class.__name__,
+                    sorted(ignored_keys),
+                )
 
         logger.info(f"Creating {dex_name} client")
         return client_class(**client_kwargs)
