@@ -71,6 +71,24 @@ class BotStartResponse(BaseModel):
     message: str
 
 
+class BalanceReallocateRequest(BaseModel):
+    dex: Optional[str] = Field(default=None, description="DEX identifier, e.g. 'asterdex'")
+    asset: str = Field(default="USDT", description="Asset to balance between spot and futures")
+    tolerance: float = Field(default=1.0, ge=0.0, description="Skip transfer when imbalance is within this amount")
+    max_transfer: Optional[float] = Field(default=None, gt=0.0, description="Optional cap on transfer size")
+
+
+class BalanceReallocateResponse(BaseModel):
+    status: str
+    message: str
+    asset: str
+    spot_before: str
+    futures_before: str
+    spot_after: Optional[str] = None
+    futures_after: Optional[str] = None
+    transfer: Optional[Dict[str, Any]] = None
+
+
 class BotStatus(BaseModel):
     job_id: str
     dex: str
@@ -736,6 +754,182 @@ async def get_monitor_snapshot(dex_name: str) -> Dict[str, Any]:
     if not snapshot:
         raise HTTPException(status_code=404, detail=f"No monitoring data for {dex_key}")
     return snapshot
+
+
+@app.post("/balance/reallocate", response_model=BalanceReallocateResponse)
+async def rebalance_wallets(request: BalanceReallocateRequest) -> BalanceReallocateResponse:
+    dex_name = _normalize_dex_name(request.dex)
+    if dex_name not in DexFactory.list_supported_dexes():
+        raise HTTPException(status_code=400, detail=f"Unsupported DEX '{dex_name}'")
+
+    asset = request.asset.upper()
+    tolerance = Decimal(str(request.tolerance))
+    max_transfer = Decimal(str(request.max_transfer)) if request.max_transfer else None
+
+    try:
+        credentials = _resolve_credentials(dex_name)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    client = DexFactory.create_client(dex_name, **credentials)
+
+    def _to_decimal(value: Any) -> Decimal:
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError):
+            return Decimal("0")
+
+    spot_balance = client.get_spot_balance() or []
+    futures_balance = client.get_futures_balance() or {}
+
+    spot_entry = next((item for item in spot_balance if item.get("asset") == asset), None)
+    spot_free = _to_decimal(spot_entry.get("free")) if spot_entry else Decimal("0")
+
+    futures_available = Decimal("0")
+    if isinstance(futures_balance, dict):
+        futures_available = max(
+            futures_available,
+            _to_decimal(futures_balance.get("availableBalance")),
+            _to_decimal(futures_balance.get("maxWithdrawAmount")),
+            _to_decimal(futures_balance.get("totalWalletBalance")),
+            _to_decimal(futures_balance.get("totalMarginBalance")),
+        )
+        for entry in futures_balance.get("assets", []) or []:
+            if entry.get("asset") == asset:
+                futures_available = max(
+                    futures_available,
+                    _to_decimal(entry.get("availableBalance")),
+                    _to_decimal(entry.get("maxWithdrawAmount")),
+                    _to_decimal(entry.get("walletBalance")),
+                )
+                break
+    elif isinstance(futures_balance, list):
+        for entry in futures_balance:
+            if entry.get("asset") == asset:
+                futures_available = max(
+                    futures_available,
+                    _to_decimal(entry.get("availableBalance")),
+                    _to_decimal(entry.get("maxWithdrawAmount")),
+                    _to_decimal(entry.get("walletBalance")),
+                    _to_decimal(entry.get("balance")),
+                )
+
+    total = spot_free + futures_available
+    if total <= 0:
+        return BalanceReallocateResponse(
+            status="skipped",
+            message="No funds available to rebalance",
+            asset=asset,
+            spot_before=str(spot_free),
+            futures_before=str(futures_available),
+        )
+
+    target = (total / Decimal("2")).quantize(Decimal("0.0001"))
+    imbalance = spot_free - target
+
+    if imbalance.copy_abs() <= tolerance:
+        return BalanceReallocateResponse(
+            status="skipped",
+            message="Balances already within tolerance",
+            asset=asset,
+            spot_before=str(spot_free),
+            futures_before=str(futures_available),
+        )
+
+    if max_transfer is not None:
+        transfer_amount = min(imbalance.copy_abs(), max_transfer)
+    else:
+        transfer_amount = imbalance.copy_abs()
+
+    if transfer_amount <= 0:
+        return BalanceReallocateResponse(
+            status="skipped",
+            message="Calculated transfer amount is zero",
+            asset=asset,
+            spot_before=str(spot_free),
+            futures_before=str(futures_available),
+        )
+
+    if imbalance > 0:
+        direction = "SPOT_FUTURE"
+        transferable = spot_free - target
+    else:
+        direction = "FUTURE_SPOT"
+        transferable = futures_available - target
+
+    if transferable <= Decimal("0"):
+        return BalanceReallocateResponse(
+            status="skipped",
+            message="Source balance insufficient to rebalance",
+            asset=asset,
+            spot_before=str(spot_free),
+            futures_before=str(futures_available),
+        )
+
+    transfer_amount = min(transfer_amount, transferable)
+    transfer_amount = transfer_amount.quantize(Decimal("0.0001"))
+    if transfer_amount <= Decimal("0"):
+        return BalanceReallocateResponse(
+            status="skipped",
+            message="Transfer amount below precision",
+            asset=asset,
+            spot_before=str(spot_free),
+            futures_before=str(futures_available),
+        )
+
+    try:
+        transfer_response = client.transfer_between_wallets(
+            asset=asset,
+            amount=transfer_amount,
+            direction=direction,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=500, detail=f"Transfer failed: {exc}") from exc
+
+    spot_after_balance = client.get_spot_balance() or []
+    futures_after_balance = client.get_futures_balance() or {}
+
+    spot_after_entry = next((item for item in spot_after_balance if item.get("asset") == asset), None)
+    spot_after = _to_decimal(spot_after_entry.get("free")) if spot_after_entry else Decimal("0")
+
+    futures_after = Decimal("0")
+    if isinstance(futures_after_balance, dict):
+        futures_after = max(
+            futures_after,
+            _to_decimal(futures_after_balance.get("availableBalance")),
+            _to_decimal(futures_after_balance.get("totalWalletBalance")),
+        )
+        for entry in futures_after_balance.get("assets", []) or []:
+            if entry.get("asset") == asset:
+                futures_after = max(
+                    futures_after,
+                    _to_decimal(entry.get("availableBalance")),
+                    _to_decimal(entry.get("walletBalance")),
+                )
+                break
+    elif isinstance(futures_after_balance, list):
+        for entry in futures_after_balance:
+            if entry.get("asset") == asset:
+                futures_after = max(
+                    futures_after,
+                    _to_decimal(entry.get("availableBalance")),
+                    _to_decimal(entry.get("walletBalance")),
+                )
+
+    return BalanceReallocateResponse(
+        status="transferred",
+        message=f"Moved {transfer_amount} {asset} via {direction}",
+        asset=asset,
+        spot_before=str(spot_free),
+        futures_before=str(futures_available),
+        spot_after=str(spot_after),
+        futures_after=str(futures_after),
+        transfer={
+            "direction": direction,
+            "amount": str(transfer_amount),
+            "response": transfer_response,
+        },
+    )
 
 
 @app.get("/monitor/{dex_name}/simple", response_class=PlainTextResponse)

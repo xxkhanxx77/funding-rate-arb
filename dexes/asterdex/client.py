@@ -7,6 +7,7 @@ Refactored from the original funding_bot.py
 import hashlib
 import hmac
 import time
+import uuid
 import requests
 import logging
 from decimal import Decimal, ROUND_DOWN
@@ -232,6 +233,44 @@ class AsterDexClient(BaseDexInterface):
         except Exception as e:
             logger.error(f"Error placing futures short order: {e}")
             raise
+
+    def transfer_between_wallets(
+        self,
+        asset: str,
+        amount: Decimal,
+        direction: str,
+        client_tran_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Transfer assets between spot and futures wallets."""
+
+        direction = direction.upper()
+        if direction not in {"SPOT_FUTURE", "FUTURE_SPOT"}:
+            raise ValueError(f"Unsupported transfer direction: {direction}")
+
+        payload = {
+            "asset": asset.upper(),
+            "amount": self._decimal_to_str(amount),
+            "clientTranId": client_tran_id or uuid.uuid4().hex,
+            "kindType": direction,
+        }
+
+        try:
+            return self._request(
+                self.futures_base_url,
+                "/fapi/v1/asset/wallet/transfer",
+                method="POST",
+                params=payload,
+                signed=True,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Primary futures transfer failed (%s); retrying via spot endpoint", exc)
+            return self._request(
+                self.spot_base_url,
+                "/api/v1/asset/wallet/transfer",
+                method="POST",
+                params=payload,
+                signed=True,
+            )
 
     def get_symbol_info(self, symbol: str, market_type: str = "spot") -> Dict[str, Any]:
         """Get symbol trading information"""
